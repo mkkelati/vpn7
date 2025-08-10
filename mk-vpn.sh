@@ -54,6 +54,7 @@ WS_PATH=""
 XRAY_PORT=""
 DRY_RUN=false
 USE_SELF_SIGNED=false
+USE_DIRECT_PORT=false
 
 ################################################################################
 # Utility Functions
@@ -149,10 +150,48 @@ validate_domain() {
 # Check if port is available
 check_port() {
     local port=$1
+    local service_name=${2:-"Unknown"}
+    
     # Use ss instead of netstat (more modern and commonly available)
     if command -v ss >/dev/null 2>&1; then
-        if ss -tuln | grep -q ":$port "; then
-            error_exit "Port $port is already in use"
+        local port_info
+        port_info=$(ss -tuln | grep ":$port ")
+        if [[ -n $port_info ]]; then
+            log "WARN" "Port $port is already in use by $service_name"
+            
+            # If it's our own services, offer to restart
+            if [[ $port == "443" ]] || [[ $port == "80" ]]; then
+                read -p "Port $port is in use. Stop existing services and continue? (y/N): " stop_services
+                if [[ $stop_services =~ ^[Yy] ]]; then
+                    log "INFO" "Stopping existing services..."
+                    systemctl stop nginx xray 2>/dev/null || true
+                    pkill -f xray 2>/dev/null || true
+                    sleep 2
+                    
+                    # Check again
+                    port_info=$(ss -tuln | grep ":$port ")
+                    if [[ -n $port_info ]]; then
+                        error_exit "Port $port is still in use after stopping services"
+                    fi
+                    log "SUCCESS" "Port $port is now available"
+                else
+                    error_exit "Cannot continue with port $port in use"
+                fi
+            elif [[ $port == "10085" ]]; then
+                log "INFO" "Xray port $port is in use, attempting to stop Xray service..."
+                systemctl stop xray 2>/dev/null || true
+                pkill -f xray 2>/dev/null || true
+                sleep 2
+                
+                # Check again
+                port_info=$(ss -tuln | grep ":$port ")
+                if [[ -n $port_info ]]; then
+                    error_exit "Port $port is still in use after stopping Xray"
+                fi
+                log "SUCCESS" "Port $port is now available"
+            else
+                error_exit "Port $port is already in use"
+            fi
         fi
     elif command -v netstat >/dev/null 2>&1; then
         if netstat -tuln | grep -q ":$port "; then
@@ -184,8 +223,168 @@ init_user_db() {
     if [[ ! -f $USER_DB_FILE ]]; then
         echo '{"users": []}' > "$USER_DB_FILE"
         chmod 640 "$USER_DB_FILE"
+        chown xray:xray "$USER_DB_FILE" 2>/dev/null || true
         log "INFO" "Initialized user database"
     fi
+}
+
+# Check for incomplete installation
+check_incomplete_installation() {
+    local has_xray=false
+    local has_nginx_config=false
+    local has_config_env=false
+    local has_user_db=false
+    
+    # Check for existing components
+    [[ -f /usr/local/bin/xray ]] && has_xray=true
+    
+    # Check for nginx configs (more robust)
+    for config in "${NGINX_SITES_DIR}/"*; do
+        if [[ -f "$config" ]] && [[ "$(basename "$config")" != "default" ]] && [[ "$(basename "$config")" != "default.bak" ]]; then
+            has_nginx_config=true
+            break
+        fi
+    done
+    
+    [[ -f "${XRAY_DATA_DIR}/config.env" ]] && has_config_env=true
+    [[ -f "$USER_DB_FILE" ]] && has_user_db=true
+    
+    # If we have some components but not all, it's incomplete
+    if [[ $has_xray == true ]] || [[ $has_nginx_config == true ]]; then
+        log "INFO" "Detected existing MK VPN components"
+        
+        if [[ $has_config_env == false ]] || [[ $has_user_db == false ]]; then
+            log "WARN" "Installation appears incomplete"
+            print_color "$YELLOW" "Found existing installation that may be incomplete:"
+            print_color "$CYAN" "  Xray binary: $(if [[ $has_xray == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+            print_color "$CYAN" "  NGINX config: $(if [[ $has_nginx_config == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+            print_color "$CYAN" "  Installation config: $(if [[ $has_config_env == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+            print_color "$CYAN" "  User database: $(if [[ $has_user_db == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+            echo
+            
+            read -p "What would you like to do? [1] Clean install [2] Try to complete [3] Cancel: " choice
+            case $choice in
+                1)
+                    log "INFO" "Performing clean installation..."
+                    cmd_cleanup_installation
+                    return 0
+                    ;;
+                2)
+                    log "INFO" "Attempting to complete installation..."
+                    attempt_complete_installation
+                    return 1
+                    ;;
+                *)
+                    log "INFO" "Installation cancelled"
+                    exit 0
+                    ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
+# Attempt to complete an incomplete installation
+attempt_complete_installation() {
+    log "INFO" "Attempting to complete incomplete installation..."
+    
+    # Try to find existing configuration
+    local existing_domain=""
+    local existing_ws_path=""
+    local existing_xray_port=""
+    local existing_ssl_type=""
+    
+    # Look for NGINX configs to extract info
+    for config_file in "${NGINX_SITES_DIR}/"*; do
+        if [[ -f "$config_file" ]] && [[ "$(basename "$config_file")" != "default" ]] && [[ "$(basename "$config_file")" != "default.bak" ]]; then
+            existing_domain=$(basename "$config_file")
+            existing_ws_path=$(grep -o 'location [^{]*' "$config_file" | head -n1 | awk '{print $2}' 2>/dev/null || echo "")
+            if grep -q "self-signed" "$config_file" || grep -q "/etc/ssl/xray/" "$config_file"; then
+                existing_ssl_type="self-signed"
+            else
+                existing_ssl_type="letsencrypt"
+            fi
+            break
+        fi
+    done
+    
+    # Look for Xray config to extract port
+    if [[ -f "$XRAY_CONFIG_FILE" ]]; then
+        existing_xray_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG_FILE" 2>/dev/null || echo "10085")
+    fi
+    
+    # Set defaults if not found
+    [[ -z "$existing_domain" ]] && existing_domain="localhost"
+    [[ -z "$existing_ws_path" ]] && existing_ws_path="/$(openssl rand -hex 8)"
+    [[ -z "$existing_xray_port" ]] && existing_xray_port="10085"
+    [[ -z "$existing_ssl_type" ]] && existing_ssl_type="self-signed"
+    
+    # Create missing config.env
+    if [[ ! -f "${XRAY_DATA_DIR}/config.env" ]]; then
+        cat > "${XRAY_DATA_DIR}/config.env" << EOF
+DOMAIN=${existing_domain}
+WS_PATH=${existing_ws_path}
+XRAY_PORT=${existing_xray_port}
+USE_SELF_SIGNED=$(if [[ "$existing_ssl_type" == "self-signed" ]]; then echo "true"; else echo "false"; fi)
+EOF
+        log "SUCCESS" "Created missing config.env"
+    fi
+    
+    # Create missing user database
+    if [[ ! -f "$USER_DB_FILE" ]]; then
+        echo '{"users": []}' > "$USER_DB_FILE"
+        chmod 640 "$USER_DB_FILE"
+        chown xray:xray "$USER_DB_FILE" 2>/dev/null || true
+        log "SUCCESS" "Created missing user database"
+    fi
+    
+    # Try to start services
+    systemctl enable xray nginx 2>/dev/null || true
+    systemctl start nginx xray 2>/dev/null || true
+    
+    log "SUCCESS" "Installation completion attempted"
+    print_color "$GREEN" "Configuration recovered:"
+    print_color "$CYAN" "  Domain: $existing_domain"
+    print_color "$CYAN" "  WebSocket Path: $existing_ws_path"
+    print_color "$CYAN" "  Xray Port: $existing_xray_port"
+    print_color "$CYAN" "  SSL Type: $existing_ssl_type"
+}
+
+# Clean up incomplete installation
+cmd_cleanup_installation() {
+    log "INFO" "Cleaning up incomplete installation..."
+    
+    if [[ $DRY_RUN == true ]]; then
+        log "INFO" "DRY RUN: Would clean up installation"
+        return
+    fi
+    
+    # Stop services
+    systemctl stop xray nginx 2>/dev/null || true
+    systemctl disable xray 2>/dev/null || true
+    
+    # Kill any remaining processes
+    pkill -f xray 2>/dev/null || true
+    
+    # Remove files but keep user data
+    rm -f /usr/local/bin/xray
+    rm -f "${SYSTEMD_DIR}/xray.service"
+    rm -rf "${NGINX_SITES_DIR}/"*.com "${NGINX_SITES_DIR}/"*.org "${NGINX_SITES_DIR}/"*.net 2>/dev/null || true
+    rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
+    
+    # Remove SSL certificates but not Let's Encrypt ones
+    rm -rf /etc/ssl/xray 2>/dev/null || true
+    
+    # Clean up config but preserve user database
+    rm -f "${XRAY_DATA_DIR}/config.env" 2>/dev/null || true
+    
+    # Remove Xray config
+    rm -f "$XRAY_CONFIG_FILE" 2>/dev/null || true
+    
+    # Reload systemd
+    systemctl daemon-reload
+    
+    log "SUCCESS" "Cleanup completed - ready for fresh installation"
 }
 
 ################################################################################
@@ -420,6 +619,136 @@ EOF
     chmod 640 "$XRAY_CONFIG_FILE"
     chown xray:xray "$XRAY_CONFIG_FILE"
     log "SUCCESS" "Xray configuration generated"
+}
+
+# Generate Xray configuration for direct TLS handling
+generate_xray_config_direct() {
+    local uuid=$1
+    local domain=$2
+    local ws_path=$3
+    local port=${4:-443}
+    local cert_path="/etc/ssl/xray/cert.crt"
+    local key_path="/etc/ssl/xray/private.key"
+    
+    if [[ $DRY_RUN == true ]]; then
+        log "INFO" "DRY RUN: Would generate Xray direct TLS configuration"
+        return
+    fi
+    
+    # Generate self-signed certificate if using direct mode
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        generate_self_signed_cert "$domain"
+    fi
+    
+    cat > "$XRAY_CONFIG_FILE" << EOF
+{
+  "log": {
+    "access": "${XRAY_LOG_DIR}/access.log",
+    "error": "${XRAY_LOG_DIR}/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${cert_path}",
+              "keyFile": "${key_path}"
+            }
+          ]
+        },
+        "wsSettings": {
+          "path": "${ws_path}"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "port": $((port + 1)),
+      "protocol": "vmess",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}",
+            "alterId": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "${cert_path}",
+              "keyFile": "${key_path}"
+            }
+          ]
+        },
+        "wsSettings": {
+          "path": "${ws_path}/vmess"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
+  ],
+  "routing": {
+    "rules": []
+  },
+  "stats": {},
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
+    }
+  }
+}
+EOF
+    
+    chmod 640 "$XRAY_CONFIG_FILE"
+    chown xray:xray "$XRAY_CONFIG_FILE"
+    log "SUCCESS" "Xray direct TLS configuration generated"
 }
 
 ################################################################################
@@ -1056,6 +1385,13 @@ cmd_install() {
     # Check prerequisites
     check_root
     check_ubuntu_version
+    
+    # Check for incomplete installation
+    if ! check_incomplete_installation; then
+        # Installation was completed, exit
+        return 0
+    fi
+    
     create_directories
     
     # Install packages
@@ -1087,6 +1423,25 @@ cmd_install() {
                 log "INFO" "Using Let's Encrypt certificates"
                 ;;
         esac
+        
+        # Ask about port configuration
+        echo
+        print_color "$CYAN" "Port Configuration:"
+        print_color "$WHITE" "1. Standard (NGINX proxy: clients→443→nginx→10085→xray)"
+        print_color "$WHITE" "2. Direct (Xray handles TLS: clients→443→xray directly)"
+        echo
+        read -p "Choose port configuration [1-2]: " port_choice
+        
+        case $port_choice in
+            2)
+                USE_DIRECT_PORT=true
+                log "INFO" "Using direct port 443 for Xray"
+                ;;
+            *)
+                USE_DIRECT_PORT=false
+                log "INFO" "Using NGINX reverse proxy configuration"
+                ;;
+        esac
     fi
     
     if [[ -z $WS_PATH ]]; then
@@ -1095,9 +1450,13 @@ cmd_install() {
     fi
     
     if [[ -z $XRAY_PORT ]]; then
-        XRAY_PORT=10085
+        if [[ $USE_DIRECT_PORT == true ]]; then
+            XRAY_PORT=443
+        else
+            XRAY_PORT=10085
+        fi
     fi
-    check_port "$XRAY_PORT"
+    check_port "$XRAY_PORT" "Xray"
     
     # Generate initial UUID
     local initial_uuid
@@ -1106,9 +1465,13 @@ cmd_install() {
     # Install and configure components
     install_xray
     create_xray_service
-    generate_xray_config "$initial_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
-    configure_nginx "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
-    setup_ssl "$DOMAIN"
+    if [[ $USE_DIRECT_PORT == true ]]; then
+        generate_xray_config_direct "$initial_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+    else
+        generate_xray_config "$initial_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+        configure_nginx "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+        setup_ssl "$DOMAIN"
+    fi
     configure_firewall
     setup_logrotate
     init_user_db
@@ -1116,7 +1479,9 @@ cmd_install() {
     # Start services
     if [[ $DRY_RUN == false ]]; then
         systemctl start xray
-        systemctl reload nginx
+        if [[ $USE_DIRECT_PORT == false ]]; then
+            systemctl reload nginx
+        fi
     fi
     
     # Add initial user
@@ -1128,6 +1493,7 @@ DOMAIN=${DOMAIN}
 WS_PATH=${WS_PATH}
 XRAY_PORT=${XRAY_PORT}
 USE_SELF_SIGNED=${USE_SELF_SIGNED}
+USE_DIRECT_PORT=${USE_DIRECT_PORT}
 EOF
     
     log "SUCCESS" "MK VPN installation completed successfully!"
@@ -1137,6 +1503,7 @@ EOF
     print_color "$CYAN" "WebSocket Path: $WS_PATH"
     print_color "$CYAN" "Xray Port: $XRAY_PORT"
     print_color "$CYAN" "SSL Type: $(if [[ $USE_SELF_SIGNED == true ]]; then echo "Self-signed"; else echo "Let's Encrypt"; fi)"
+    print_color "$CYAN" "Port Mode: $(if [[ $USE_DIRECT_PORT == true ]]; then echo "Direct (Xray handles TLS)"; else echo "Proxy (NGINX → Xray)"; fi)"
     print_color "$CYAN" "Admin UUID: $initial_uuid"
     echo
     print_color "$YELLOW" "Next steps:"
@@ -1581,8 +1948,9 @@ show_menu() {
     print_color "$WHITE" " 6) Backup Configuration"
     print_color "$WHITE" " 7) Restore Configuration"
     print_color "$WHITE" " 8) System Status"
-    print_color "$WHITE" " 9) Self Update"
-    print_color "$WHITE" "10) Uninstall"
+    print_color "$WHITE" " 9) Clean Installation"
+    print_color "$WHITE" "10) Self Update"
+    print_color "$WHITE" "11) Uninstall"
     print_color "$WHITE" " 0) Exit"
     echo
 }
@@ -1591,7 +1959,7 @@ show_menu() {
 interactive_menu() {
     while true; do
         show_menu
-        read -p "Enter your choice [0-10]: " choice
+        read -p "Enter your choice [0-11]: " choice
         echo
         
         case $choice in
@@ -1621,9 +1989,12 @@ interactive_menu() {
                 cmd_status
                 ;;
             9)
-                cmd_self_update
+                cmd_cleanup_installation
                 ;;
             10)
+                cmd_self_update
+                ;;
+            11)
                 cmd_uninstall
                 ;;
             0)
@@ -1661,6 +2032,7 @@ COMMANDS:
     backup                           - Create configuration backup
     restore <file>                   - Restore from backup
     status                           - Show system status
+    cleanup                          - Clean incomplete installation
     self-update                      - Update script to latest version
     uninstall                        - Remove MK VPN installation
 
@@ -1673,6 +2045,7 @@ ADD-USER OPTIONS:
 GLOBAL OPTIONS:
     --dry-run                        - Show what would be done without executing
     --self-signed                    - Use self-signed certificates instead of Let's Encrypt
+    --direct-port                    - Use Xray on port 443 directly (no NGINX proxy)
     --domain <domain>                - Set domain name
     --ws-path <path>                 - Set WebSocket path
     --xray-port <port>               - Set Xray port
@@ -1685,6 +2058,9 @@ EXAMPLES:
     # Install MK VPN with self-signed certificates
     $0 install --self-signed
 
+    # Install with Xray handling TLS directly on port 443
+    $0 install --self-signed --direct-port
+
     # Add a user with 30-day expiry and 100GB limit
     $0 add-user --name john --expiry 30 --limit 100
 
@@ -1696,6 +2072,9 @@ EXAMPLES:
 
     # Check status
     $0 status
+
+    # Clean incomplete installation
+    $0 cleanup
 
     # Interactive menu (no arguments)
     $0
@@ -1745,7 +2124,11 @@ main() {
                 USE_SELF_SIGNED=true
                 shift
                 ;;
-            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|uninstall|self-update)
+            --direct-port)
+                USE_DIRECT_PORT=true
+                shift
+                ;;
+            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|cleanup|uninstall|self-update)
                 break
                 ;;
             *)
@@ -1788,6 +2171,9 @@ main() {
             ;;
         status)
             cmd_status "$@"
+            ;;
+        cleanup)
+            cmd_cleanup_installation "$@"
             ;;
         uninstall)
             cmd_uninstall "$@"
