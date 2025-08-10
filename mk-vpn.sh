@@ -1572,7 +1572,14 @@ cmd_add_user() {
     if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
         source "${XRAY_DATA_DIR}/config.env"
     else
-        error_exit "Installation not found. Run 'mk-vpn install' first."
+        print_color "$RED" "❌ Installation not found!"
+        echo
+        print_color "$YELLOW" "Available options:"
+        print_color "$WHITE" "1. Run 'menu install' to install from scratch"
+        print_color "$WHITE" "2. Use option 4 'Force Complete Installation' to fix"
+        print_color "$WHITE" "3. Use option 5 'Quick Add User (Auto-fix)' instead"
+        echo
+        error_exit "Use one of the options above to fix the installation"
     fi
     
     # Add user
@@ -1920,6 +1927,263 @@ cmd_self_update() {
     print_color "$GREEN" "Please run 'menu' to use the updated version"
 }
 
+# Force complete installation - creates missing config files
+cmd_force_complete_installation() {
+    log "INFO" "Force completing MK VPN installation..."
+    
+    check_root
+    
+    print_color "$YELLOW" "This will attempt to complete your installation using existing components."
+    echo
+    
+    # Check what exists
+    local has_xray=false
+    local has_nginx=false
+    local has_cert=false
+    
+    [[ -f /usr/local/bin/xray ]] && has_xray=true
+    systemctl is-active --quiet nginx && has_nginx=true
+    [[ -f /etc/ssl/xray/cert.crt ]] && has_cert=true
+    
+    print_color "$CYAN" "Current Status:"
+    print_color "$WHITE" "  Xray Binary: $(if [[ $has_xray == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+    print_color "$WHITE" "  NGINX Service: $(if [[ $has_nginx == true ]]; then echo "✓ Running"; else echo "✗ Not running"; fi)"
+    print_color "$WHITE" "  SSL Certificate: $(if [[ $has_cert == true ]]; then echo "✓ Found"; else echo "✗ Missing"; fi)"
+    echo
+    
+    # Get configuration from user if missing
+    local domain=""
+    local ws_path=""
+    local xray_port=""
+    local use_self_signed="true"
+    local use_direct_port="true"
+    
+    read -p "Enter your domain: " domain
+    [[ -z "$domain" ]] && domain="localhost"
+    
+    read -p "Enter WebSocket path (or press Enter for random): " ws_path
+    [[ -z "$ws_path" ]] && ws_path="/$(openssl rand -hex 8)"
+    
+    print_color "$CYAN" "SSL Certificate Type:"
+    print_color "$WHITE" "1. Let's Encrypt"
+    print_color "$WHITE" "2. Self-signed (recommended)"
+    read -p "Choose [1-2]: " ssl_choice
+    [[ "$ssl_choice" == "1" ]] && use_self_signed="false"
+    
+    print_color "$CYAN" "Port Configuration:"
+    print_color "$WHITE" "1. NGINX Proxy (clients→443→nginx→10085→xray)"  
+    print_color "$WHITE" "2. Direct TLS (clients→443→xray directly)"
+    read -p "Choose [1-2]: " port_choice
+    
+    if [[ "$port_choice" == "1" ]]; then
+        use_direct_port="false"
+        xray_port="10085"
+    else
+        use_direct_port="true"
+        xray_port="443"
+    fi
+    
+    # Create directories
+    create_directories
+    
+    # Install missing components
+    if [[ $has_xray == false ]]; then
+        log "INFO" "Installing Xray..."
+        install_xray
+        create_xray_service
+    fi
+    
+    # Generate UUID
+    local admin_uuid
+    admin_uuid=$(generate_uuid)
+    
+    # Generate configuration
+    if [[ "$use_direct_port" == "true" ]]; then
+        generate_xray_config_direct "$admin_uuid" "$domain" "$ws_path" "$xray_port"
+    else
+        generate_xray_config "$admin_uuid" "$domain" "$ws_path" "$xray_port"
+        configure_nginx "$domain" "$ws_path" "$xray_port"
+        if [[ "$use_self_signed" == "true" ]]; then
+            USE_SELF_SIGNED=true
+            generate_self_signed_cert "$domain"
+        fi
+    fi
+    
+    # Create config file
+    cat > "${XRAY_DATA_DIR}/config.env" << EOF
+DOMAIN=${domain}
+WS_PATH=${ws_path}
+XRAY_PORT=${xray_port}
+USE_SELF_SIGNED=${use_self_signed}
+USE_DIRECT_PORT=${use_direct_port}
+EOF
+    
+    # Initialize user database and add admin user
+    init_user_db
+    add_user_to_db "admin" "$admin_uuid" 0 0 "vless"
+    
+    # Start services
+    systemctl enable xray nginx 2>/dev/null || true
+    systemctl start xray
+    if [[ "$use_direct_port" == "false" ]]; then
+        systemctl start nginx
+    fi
+    
+    log "SUCCESS" "Installation force completed!"
+    echo
+    print_color "$GREEN" "=== Configuration Summary ==="
+    print_color "$CYAN" "Domain: $domain"
+    print_color "$CYAN" "WebSocket Path: $ws_path"
+    print_color "$CYAN" "Xray Port: $xray_port"
+    print_color "$CYAN" "SSL Type: $(if [[ $use_self_signed == true ]]; then echo "Self-signed"; else echo "Let's Encrypt"; fi)"
+    print_color "$CYAN" "Port Mode: $(if [[ $use_direct_port == true ]]; then echo "Direct TLS"; else echo "NGINX Proxy"; fi)"
+    print_color "$CYAN" "Admin UUID: $admin_uuid"
+    echo
+    print_color "$YELLOW" "✨ You can now add users with option 2 or 5!"
+}
+
+# Quick add user with auto-fix missing configuration
+cmd_quick_add_user() {
+    log "INFO" "Quick add user with auto-fix..."
+    
+    # Check if config exists, if not try to create it
+    if [[ ! -f "${XRAY_DATA_DIR}/config.env" ]]; then
+        log "WARN" "Installation config missing, attempting auto-fix..."
+        
+        # Try to detect existing configuration
+        local domain="localhost"
+        local ws_path="/$(openssl rand -hex 8)"
+        local xray_port="443"
+        local use_self_signed="true"
+        local use_direct_port="true"
+        
+        # Look for NGINX configs
+        for config_file in "${NGINX_SITES_DIR}/"*; do
+            if [[ -f "$config_file" ]] && [[ "$(basename "$config_file")" != "default" ]]; then
+                domain=$(basename "$config_file")
+                ws_path=$(grep -o 'location [^{]*' "$config_file" | head -n1 | awk '{print $2}' 2>/dev/null || echo "$ws_path")
+                if grep -q "/etc/ssl/xray/" "$config_file"; then
+                    use_self_signed="true"
+                    use_direct_port="false"
+                    xray_port="10085"
+                fi
+                break
+            fi
+        done
+        
+        # Look for Xray config
+        if [[ -f "$XRAY_CONFIG_FILE" ]]; then
+            local detected_port
+            detected_port=$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG_FILE" 2>/dev/null)
+            if [[ -n "$detected_port" ]]; then
+                xray_port="$detected_port"
+                if [[ "$xray_port" == "443" ]]; then
+                    use_direct_port="true"
+                else
+                    use_direct_port="false"
+                fi
+            fi
+        fi
+        
+        # Create missing config
+        cat > "${XRAY_DATA_DIR}/config.env" << EOF
+DOMAIN=${domain}
+WS_PATH=${ws_path}
+XRAY_PORT=${xray_port}
+USE_SELF_SIGNED=${use_self_signed}
+USE_DIRECT_PORT=${use_direct_port}
+EOF
+        
+        # Initialize user database if missing
+        if [[ ! -f "$USER_DB_FILE" ]]; then
+            init_user_db
+        fi
+        
+        log "SUCCESS" "Auto-fixed configuration using detected settings"
+        print_color "$CYAN" "Detected: Domain=$domain, WebSocket=$ws_path, Port=$xray_port"
+    fi
+    
+    # Now proceed with normal user addition
+    local name=""
+    local expiry=30
+    local limit=0
+    local protocol="vless"
+    
+    read -p "Enter username: " name
+    [[ -z "$name" ]] && error_exit "Username is required"
+    
+    read -p "Enter expiry days (default 30): " expiry_input
+    [[ -n "$expiry_input" ]] && expiry="$expiry_input"
+    
+    read -p "Enter traffic limit in GB (0 for unlimited): " limit_input
+    [[ -n "$limit_input" ]] && limit="$limit_input"
+    
+    # Check if user already exists
+    if [[ -f "$USER_DB_FILE" ]] && jq -e ".users[] | select(.name == \"$name\")" "$USER_DB_FILE" >/dev/null 2>&1; then
+        error_exit "User $name already exists"
+    fi
+    
+    # Generate UUID and add user
+    local uuid
+    uuid=$(generate_uuid)
+    
+    # Load configuration
+    source "${XRAY_DATA_DIR}/config.env"
+    
+    # Add user to database
+    add_user_to_db "$name" "$uuid" "$expiry" "$limit" "$protocol"
+    
+    # Update Xray configuration if needed
+    if [[ -f "$XRAY_CONFIG_FILE" ]]; then
+        update_xray_config_user "$uuid" "$protocol"
+    fi
+    
+    # Generate client configuration
+    local server_ip
+    server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip || echo "YOUR_SERVER_IP")
+    
+    local connect_host="$DOMAIN"
+    local insecure_param=""
+    local port=443
+    
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        connect_host="$server_ip"
+        insecure_param="&allowInsecure=1"
+    fi
+    
+    if [[ $USE_DIRECT_PORT == false ]]; then
+        port=443  # NGINX proxy always uses 443
+    else
+        port=$XRAY_PORT  # Direct mode uses configured port
+    fi
+    
+    local client_link="vless://${uuid}@${connect_host}:${port}?type=ws&security=tls&path=${WS_PATH}&host=${DOMAIN}&sni=${DOMAIN}${insecure_param}#${name}_VLESS"
+    
+    log "SUCCESS" "User $name added successfully!"
+    echo
+    print_color "$GREEN" "=== User Details ==="
+    print_color "$CYAN" "Name: $name"
+    print_color "$CYAN" "UUID: $uuid"
+    print_color "$CYAN" "Protocol: $protocol"
+    print_color "$CYAN" "Expires: $(if [[ $expiry -gt 0 ]]; then date -d "+${expiry} days" +"%Y-%m-%d"; else echo "Never"; fi)"
+    print_color "$CYAN" "Traffic Limit: $(if [[ $limit -gt 0 ]]; then echo "${limit}GB"; else echo "Unlimited"; fi)"
+    echo
+    print_color "$GREEN" "=== 🔗 VLESS WebSocket + TLS Link ==="
+    print_color "$YELLOW" "Copy this link to your VPN client:"
+    echo
+    print_color "$WHITE" "$client_link"
+    echo
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        print_color "$YELLOW" "⚠️  Important: Enable 'Allow Insecure' or 'Skip Certificate Verification' in your VPN client"
+    fi
+    echo
+    print_color "$CYAN" "🎯 Quick Setup:"
+    print_color "$WHITE" "1. Copy the link above"
+    print_color "$WHITE" "2. Paste it in V2RayNG/V2RayN/Clash"
+    print_color "$WHITE" "3. Enable 'Allow Insecure' if using self-signed certificates"
+    print_color "$WHITE" "4. Connect and enjoy!"
+}
+
 ################################################################################
 # Menu System
 ################################################################################
@@ -1943,14 +2207,16 @@ show_menu() {
     print_color "$WHITE" " 1) Install MK VPN"
     print_color "$WHITE" " 2) Add User"
     print_color "$WHITE" " 3) List Users"
-    print_color "$WHITE" " 4) Renew User"
-    print_color "$WHITE" " 5) Revoke User"
-    print_color "$WHITE" " 6) Backup Configuration"
-    print_color "$WHITE" " 7) Restore Configuration"
-    print_color "$WHITE" " 8) System Status"
-    print_color "$WHITE" " 9) Clean Installation"
-    print_color "$WHITE" "10) Self Update"
-    print_color "$WHITE" "11) Uninstall"
+    print_color "$WHITE" " 4) Force Complete Installation"
+    print_color "$WHITE" " 5) Quick Add User (Auto-fix)"
+    print_color "$WHITE" " 6) Renew User"
+    print_color "$WHITE" " 7) Revoke User"
+    print_color "$WHITE" " 8) Backup Configuration"
+    print_color "$WHITE" " 9) Restore Configuration"
+    print_color "$WHITE" "10) System Status"
+    print_color "$WHITE" "11) Clean Installation"
+    print_color "$WHITE" "12) Self Update"
+    print_color "$WHITE" "13) Uninstall"
     print_color "$WHITE" " 0) Exit"
     echo
 }
@@ -1959,7 +2225,7 @@ show_menu() {
 interactive_menu() {
     while true; do
         show_menu
-        read -p "Enter your choice [0-11]: " choice
+        read -p "Enter your choice [0-13]: " choice
         echo
         
         case $choice in
@@ -1973,28 +2239,34 @@ interactive_menu() {
                 cmd_list_users
                 ;;
             4)
-                cmd_renew_user
+                cmd_force_complete_installation
                 ;;
             5)
-                cmd_revoke_user
+                cmd_quick_add_user
                 ;;
             6)
-                cmd_backup
+                cmd_renew_user
                 ;;
             7)
+                cmd_revoke_user
+                ;;
+            8)
+                cmd_backup
+                ;;
+            9)
                 read -p "Enter backup file path: " backup_file
                 cmd_restore "$backup_file"
                 ;;
-            8)
+            10)
                 cmd_status
                 ;;
-            9)
+            11)
                 cmd_cleanup_installation
                 ;;
-            10)
+            12)
                 cmd_self_update
                 ;;
-            11)
+            13)
                 cmd_uninstall
                 ;;
             0)
@@ -2032,6 +2304,8 @@ COMMANDS:
     backup                           - Create configuration backup
     restore <file>                   - Restore from backup
     status                           - Show system status
+    force-complete                   - Force complete installation (creates missing config)
+    quick-add-user                   - Add user with auto-fix (handles missing config)
     cleanup                          - Clean incomplete installation
     self-update                      - Update script to latest version
     uninstall                        - Remove MK VPN installation
@@ -2072,6 +2346,12 @@ EXAMPLES:
 
     # Check status
     $0 status
+
+    # Force complete installation (fix missing config)
+    $0 force-complete
+
+    # Quick add user with auto-fix
+    $0 quick-add-user
 
     # Clean incomplete installation
     $0 cleanup
@@ -2128,7 +2408,7 @@ main() {
                 USE_DIRECT_PORT=true
                 shift
                 ;;
-            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|cleanup|uninstall|self-update)
+            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|force-complete|quick-add-user|cleanup|uninstall|self-update)
                 break
                 ;;
             *)
@@ -2171,6 +2451,12 @@ main() {
             ;;
         status)
             cmd_status "$@"
+            ;;
+        force-complete)
+            cmd_force_complete_installation "$@"
+            ;;
+        quick-add-user)
+            cmd_quick_add_user "$@"
             ;;
         cleanup)
             cmd_cleanup_installation "$@"
