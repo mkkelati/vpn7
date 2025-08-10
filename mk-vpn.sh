@@ -2184,6 +2184,248 @@ EOF
     print_color "$WHITE" "4. Connect and enjoy!"
 }
 
+# Fix Xray Service - Comprehensive troubleshooting and auto-repair
+cmd_fix_xray_service() {
+    log "INFO" "Diagnosing and fixing Xray service issues..."
+    
+    check_root
+    
+    print_color "$GREEN" "=== 🔧 Xray Service Troubleshooter ==="
+    echo
+    
+    # Step 1: Check current status
+    print_color "$CYAN" "Step 1: Checking Xray service status..."
+    local xray_status="stopped"
+    if systemctl is-active --quiet xray; then
+        xray_status="running"
+        print_color "$GREEN" "✓ Xray service is running"
+    else
+        print_color "$RED" "✗ Xray service is not running"
+        
+        # Show detailed error
+        print_color "$YELLOW" "Service error details:"
+        systemctl status xray --no-pager -l | head -10
+        echo
+    fi
+    
+    # Step 2: Check Xray binary
+    print_color "$CYAN" "Step 2: Checking Xray binary..."
+    if [[ -f /usr/local/bin/xray ]]; then
+        print_color "$GREEN" "✓ Xray binary found"
+        local xray_version
+        xray_version=$(/usr/local/bin/xray version 2>/dev/null | head -1 || echo "Unknown")
+        print_color "$WHITE" "  Version: $xray_version"
+    else
+        print_color "$RED" "✗ Xray binary missing"
+        read -p "Download and install Xray? (y/N): " install_xray
+        if [[ $install_xray =~ ^[Yy] ]]; then
+            install_xray
+            create_xray_service
+        fi
+    fi
+    
+    # Step 3: Check configuration file
+    print_color "$CYAN" "Step 3: Checking Xray configuration..."
+    if [[ -f "$XRAY_CONFIG_FILE" ]]; then
+        print_color "$GREEN" "✓ Configuration file exists"
+        
+        # Test configuration
+        if /usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" >/dev/null 2>&1; then
+            print_color "$GREEN" "✓ Configuration is valid"
+        else
+            print_color "$RED" "✗ Configuration has errors"
+            print_color "$YELLOW" "Configuration test output:"
+            /usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" 2>&1 | head -10
+            echo
+        fi
+    else
+        print_color "$RED" "✗ Configuration file missing"
+        if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+            print_color "$YELLOW" "Found config.env, regenerating Xray configuration..."
+            source "${XRAY_DATA_DIR}/config.env"
+            local admin_uuid
+            admin_uuid=$(generate_uuid)
+            
+            if [[ $USE_DIRECT_PORT == true ]]; then
+                generate_xray_config_direct "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+            else
+                generate_xray_config "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+            fi
+        fi
+    fi
+    
+    # Step 4: Check for missing GeoIP files (common issue)
+    print_color "$CYAN" "Step 4: Checking GeoIP database files..."
+    local geoip_missing=false
+    
+    if [[ ! -f /usr/local/bin/geoip.dat ]]; then
+        print_color "$RED" "✗ geoip.dat missing"
+        geoip_missing=true
+    else
+        print_color "$GREEN" "✓ geoip.dat found"
+    fi
+    
+    if [[ ! -f /usr/local/bin/geosite.dat ]]; then
+        print_color "$RED" "✗ geosite.dat missing"
+        geoip_missing=true
+    else
+        print_color "$GREEN" "✓ geosite.dat found"
+    fi
+    
+    if [[ $geoip_missing == true ]]; then
+        print_color "$YELLOW" "Downloading missing GeoIP files..."
+        cd /usr/local/bin
+        wget -q --timeout=30 https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat || {
+            print_color "$RED" "Failed to download geoip.dat, trying alternative..."
+            wget -q --timeout=30 https://github.com/v2fly/geoip/releases/latest/download/geoip.dat || {
+                print_color "$YELLOW" "Download failed, creating minimal geoip.dat..."
+                echo '{}' > geoip.dat
+            }
+        }
+        
+        wget -q --timeout=30 https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat || {
+            print_color "$RED" "Failed to download geosite.dat, trying alternative..."
+            wget -q --timeout=30 https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat -O geosite.dat || {
+                print_color "$YELLOW" "Download failed, creating minimal geosite.dat..."
+                echo '{}' > geosite.dat
+            }
+        }
+        
+        # Set permissions
+        chown xray:xray geoip.dat geosite.dat 2>/dev/null || true
+        chmod 644 geoip.dat geosite.dat
+        print_color "$GREEN" "✓ GeoIP files downloaded"
+    fi
+    
+    # Step 5: Check file permissions
+    print_color "$CYAN" "Step 5: Checking file permissions..."
+    local permission_issues=false
+    
+    if [[ ! -r "$XRAY_CONFIG_FILE" ]]; then
+        print_color "$RED" "✗ Configuration file not readable"
+        permission_issues=true
+    fi
+    
+    if [[ $permission_issues == true ]] || [[ ! -d "$XRAY_LOG_DIR" ]] || [[ ! -d "$XRAY_DATA_DIR" ]]; then
+        print_color "$YELLOW" "Fixing permissions and directories..."
+        
+        # Create directories
+        mkdir -p "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" "$XRAY_DATA_DIR"
+        
+        # Fix ownership and permissions
+        chown -R xray:xray "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" "$XRAY_DATA_DIR" 2>/dev/null || true
+        chmod 755 "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" "$XRAY_DATA_DIR"
+        [[ -f "$XRAY_CONFIG_FILE" ]] && chmod 640 "$XRAY_CONFIG_FILE"
+        
+        print_color "$GREEN" "✓ Permissions fixed"
+    else
+        print_color "$GREEN" "✓ Permissions OK"
+    fi
+    
+    # Step 6: Check ports
+    print_color "$CYAN" "Step 6: Checking port conflicts..."
+    if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+        source "${XRAY_DATA_DIR}/config.env"
+        
+        local port_in_use=""
+        if ss -tuln | grep -q ":$XRAY_PORT "; then
+            port_in_use=$(ss -tuln | grep ":$XRAY_PORT " | head -1)
+            print_color "$YELLOW" "⚠️  Port $XRAY_PORT is in use: $port_in_use"
+            
+            if [[ $port_in_use == *"xray"* ]]; then
+                print_color "$CYAN" "Port is used by Xray (this is normal if service is running)"
+            else
+                print_color "$RED" "Port conflict detected"
+                read -p "Stop conflicting process and continue? (y/N): " stop_conflict
+                if [[ $stop_conflict =~ ^[Yy] ]]; then
+                    systemctl stop xray nginx 2>/dev/null || true
+                    pkill -f xray 2>/dev/null || true
+                    sleep 2
+                fi
+            fi
+        else
+            print_color "$GREEN" "✓ Port $XRAY_PORT is available"
+        fi
+    fi
+    
+    # Step 7: Fix systemd service
+    print_color "$CYAN" "Step 7: Checking systemd service..."
+    if [[ ! -f /etc/systemd/system/xray.service ]]; then
+        print_color "$RED" "✗ Systemd service file missing"
+        print_color "$YELLOW" "Creating systemd service..."
+        create_xray_service
+    else
+        print_color "$GREEN" "✓ Systemd service file exists"
+    fi
+    
+    # Step 8: Attempt to start service
+    print_color "$CYAN" "Step 8: Starting Xray service..."
+    
+    # Reload systemd daemon
+    systemctl daemon-reload
+    
+    # Enable and start service
+    systemctl enable xray
+    
+    if systemctl start xray; then
+        sleep 3
+        if systemctl is-active --quiet xray; then
+            print_color "$GREEN" "✅ SUCCESS: Xray service started successfully!"
+        else
+            print_color "$RED" "❌ Service start command succeeded but service is not running"
+            print_color "$YELLOW" "Checking logs:"
+            journalctl -u xray --no-pager -n 10
+        fi
+    else
+        print_color "$RED" "❌ Failed to start Xray service"
+        print_color "$YELLOW" "Error details:"
+        systemctl status xray --no-pager -l | head -15
+        echo
+        print_color "$YELLOW" "Recent logs:"
+        journalctl -u xray --no-pager -n 15
+    fi
+    
+    # Step 9: Final status check
+    echo
+    print_color "$GREEN" "=== 📊 Final Status Report ==="
+    
+    print_color "$CYAN" "Service Status:"
+    if systemctl is-active --quiet xray; then
+        print_color "$GREEN" "  ✅ Xray: Running"
+    else
+        print_color "$RED" "  ❌ Xray: Stopped"
+    fi
+    
+    if systemctl is-active --quiet nginx; then
+        print_color "$GREEN" "  ✅ NGINX: Running"
+    else
+        print_color "$YELLOW" "  ⚠️  NGINX: Stopped (OK if using direct TLS mode)"
+    fi
+    
+    print_color "$CYAN" "Configuration:"
+    if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+        source "${XRAY_DATA_DIR}/config.env"
+        print_color "$WHITE" "  Domain: $DOMAIN"
+        print_color "$WHITE" "  WebSocket Path: $WS_PATH"
+        print_color "$WHITE" "  Port: $XRAY_PORT"
+        print_color "$WHITE" "  SSL: $(if [[ $USE_SELF_SIGNED == true ]]; then echo "Self-signed"; else echo "Let's Encrypt"; fi)"
+        print_color "$WHITE" "  Mode: $(if [[ $USE_DIRECT_PORT == true ]]; then echo "Direct TLS"; else echo "NGINX Proxy"; fi)"
+    fi
+    
+    echo
+    if systemctl is-active --quiet xray; then
+        print_color "$GREEN" "🎉 Xray is now working! You can:"
+        print_color "$WHITE" "  1. Use option 2 to add users"
+        print_color "$WHITE" "  2. Use option 5 for quick user creation"
+        print_color "$WHITE" "  3. Use option 11 to check status"
+    else
+        print_color "$RED" "⚠️  Xray is still not working. Please:"
+        print_color "$WHITE" "  1. Check the error logs above"
+        print_color "$WHITE" "  2. Try option 4 'Force Complete Installation'"
+        print_color "$WHITE" "  3. Or contact support with the error details"
+    fi
+}
+
 ################################################################################
 # Menu System
 ################################################################################
@@ -2209,14 +2451,15 @@ show_menu() {
     print_color "$WHITE" " 3) List Users"
     print_color "$WHITE" " 4) Force Complete Installation"
     print_color "$WHITE" " 5) Quick Add User (Auto-fix)"
-    print_color "$WHITE" " 6) Renew User"
-    print_color "$WHITE" " 7) Revoke User"
-    print_color "$WHITE" " 8) Backup Configuration"
-    print_color "$WHITE" " 9) Restore Configuration"
-    print_color "$WHITE" "10) System Status"
-    print_color "$WHITE" "11) Clean Installation"
-    print_color "$WHITE" "12) Self Update"
-    print_color "$WHITE" "13) Uninstall"
+    print_color "$WHITE" " 6) Fix Xray Service (Troubleshoot)"
+    print_color "$WHITE" " 7) Renew User"
+    print_color "$WHITE" " 8) Revoke User"
+    print_color "$WHITE" " 9) Backup Configuration"
+    print_color "$WHITE" "10) Restore Configuration"
+    print_color "$WHITE" "11) System Status"
+    print_color "$WHITE" "12) Clean Installation"
+    print_color "$WHITE" "13) Self Update"
+    print_color "$WHITE" "14) Uninstall"
     print_color "$WHITE" " 0) Exit"
     echo
 }
@@ -2225,7 +2468,7 @@ show_menu() {
 interactive_menu() {
     while true; do
         show_menu
-        read -p "Enter your choice [0-13]: " choice
+        read -p "Enter your choice [0-14]: " choice
         echo
         
         case $choice in
@@ -2245,28 +2488,31 @@ interactive_menu() {
                 cmd_quick_add_user
                 ;;
             6)
-                cmd_renew_user
+                cmd_fix_xray_service
                 ;;
             7)
-                cmd_revoke_user
+                cmd_renew_user
                 ;;
             8)
-                cmd_backup
+                cmd_revoke_user
                 ;;
             9)
+                cmd_backup
+                ;;
+            10)
                 read -p "Enter backup file path: " backup_file
                 cmd_restore "$backup_file"
                 ;;
-            10)
+            11)
                 cmd_status
                 ;;
-            11)
+            12)
                 cmd_cleanup_installation
                 ;;
-            12)
+            13)
                 cmd_self_update
                 ;;
-            13)
+            14)
                 cmd_uninstall
                 ;;
             0)
@@ -2306,6 +2552,7 @@ COMMANDS:
     status                           - Show system status
     force-complete                   - Force complete installation (creates missing config)
     quick-add-user                   - Add user with auto-fix (handles missing config)
+    fix-xray                         - Troubleshoot and fix Xray service issues
     cleanup                          - Clean incomplete installation
     self-update                      - Update script to latest version
     uninstall                        - Remove MK VPN installation
@@ -2352,6 +2599,9 @@ EXAMPLES:
 
     # Quick add user with auto-fix
     $0 quick-add-user
+
+    # Fix Xray service issues
+    $0 fix-xray
 
     # Clean incomplete installation
     $0 cleanup
@@ -2408,7 +2658,7 @@ main() {
                 USE_DIRECT_PORT=true
                 shift
                 ;;
-            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|force-complete|quick-add-user|cleanup|uninstall|self-update)
+            install|add-user|list-users|revoke-user|renew-user|backup|restore|status|force-complete|quick-add-user|fix-xray|cleanup|uninstall|self-update)
                 break
                 ;;
             *)
@@ -2457,6 +2707,9 @@ main() {
             ;;
         quick-add-user)
             cmd_quick_add_user "$@"
+            ;;
+        fix-xray)
+            cmd_fix_xray_service "$@"
             ;;
         cleanup)
             cmd_cleanup_installation "$@"
