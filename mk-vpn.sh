@@ -136,8 +136,17 @@ validate_domain() {
 # Check if port is available
 check_port() {
     local port=$1
-    if netstat -tuln | grep -q ":$port "; then
-        error_exit "Port $port is already in use"
+    # Use ss instead of netstat (more modern and commonly available)
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tuln | grep -q ":$port "; then
+            error_exit "Port $port is already in use"
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln | grep -q ":$port "; then
+            error_exit "Port $port is already in use"
+        fi
+    else
+        log "WARN" "Neither ss nor netstat available, skipping port check"
     fi
 }
 
@@ -178,7 +187,7 @@ update_packages() {
 
 # Install required packages
 install_packages() {
-    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime")
+    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime" "net-tools")
     local missing_packages=()
     
     log "INFO" "Checking required packages..."
@@ -419,22 +428,13 @@ configure_nginx() {
     # Remove default site
     rm -f /etc/nginx/sites-enabled/default
     
-    # Create site configuration
+    # Create initial HTTP-only configuration (SSL will be added by certbot)
     cat > "$site_config" << EOF
 server {
     listen 80;
     server_name ${domain};
-    return 301 https://\$server_name\$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name ${domain};
-    
-    # SSL configuration will be handled by certbot
     
     # Security headers
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-XSS-Protection "1; mode=block" always;
@@ -504,13 +504,38 @@ setup_ssl() {
     # Reload NGINX first
     systemctl reload nginx
     
+    # Wait a moment for NGINX to be ready
+    sleep 2
+    
+    # Check if domain resolves to this server
+    local server_ip
+    server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
+    local domain_ip
+    domain_ip=$(nslookup "$domain" | grep -A1 "Name:" | tail -n1 | awk '{print $2}' 2>/dev/null)
+    
+    if [[ "$server_ip" != "$domain_ip" ]]; then
+        log "WARN" "Domain $domain (IP: $domain_ip) does not point to this server (IP: $server_ip)"
+        log "WARN" "SSL certificate generation may fail. Please update your DNS records."
+        
+        read -p "Continue anyway? (y/N): " continue_ssl
+        if [[ ! $continue_ssl =~ ^[Yy] ]]; then
+            log "INFO" "SSL setup skipped. You can run 'certbot --nginx -d $domain' manually later."
+            return
+        fi
+    fi
+    
     # Get SSL certificate
-    certbot --nginx -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email --quiet
-    
-    # Setup auto-renewal
-    (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-    
-    log "SUCCESS" "SSL certificate obtained and auto-renewal configured"
+    if certbot --nginx -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email --quiet; then
+        log "SUCCESS" "SSL certificate obtained successfully"
+        
+        # Setup auto-renewal
+        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
+        log "SUCCESS" "SSL auto-renewal configured"
+    else
+        log "ERROR" "Failed to obtain SSL certificate"
+        log "INFO" "You can try manually later with: certbot --nginx -d $domain"
+        log "INFO" "Make sure your domain points to this server's IP: $server_ip"
+    fi
 }
 
 ################################################################################
