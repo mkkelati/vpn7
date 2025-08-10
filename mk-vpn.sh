@@ -116,8 +116,15 @@ generate_uuid() {
 # Validate domain
 validate_domain() {
     local domain=$1
-    if [[ ! $domain =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$ ]]; then
+    
+    # Basic domain format validation (allows subdomains)
+    if [[ ! $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$ ]]; then
         error_exit "Invalid domain format: $domain"
+    fi
+    
+    # Check domain length
+    if [[ ${#domain} -gt 253 ]]; then
+        error_exit "Domain name too long: $domain"
     fi
     
     # Check if domain resolves
