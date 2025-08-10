@@ -128,8 +128,20 @@ validate_domain() {
     fi
     
     # Check if domain resolves
-    if ! nslookup "$domain" >/dev/null 2>&1; then
-        log "WARN" "Domain $domain does not resolve. Continuing anyway..."
+    if command -v dig >/dev/null 2>&1; then
+        if ! dig +short "$domain" >/dev/null 2>&1; then
+            log "WARN" "Domain $domain does not resolve. Continuing anyway..."
+        fi
+    elif command -v host >/dev/null 2>&1; then
+        if ! host "$domain" >/dev/null 2>&1; then
+            log "WARN" "Domain $domain does not resolve. Continuing anyway..."
+        fi
+    elif command -v nslookup >/dev/null 2>&1; then
+        if ! nslookup "$domain" >/dev/null 2>&1; then
+            log "WARN" "Domain $domain does not resolve. Continuing anyway..."
+        fi
+    else
+        log "WARN" "No DNS lookup tools available, skipping domain resolution check"
     fi
 }
 
@@ -187,7 +199,7 @@ update_packages() {
 
 # Install required packages
 install_packages() {
-    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime" "net-tools")
+    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime" "net-tools" "dnsutils")
     local missing_packages=()
     
     log "INFO" "Checking required packages..."
@@ -510,8 +522,16 @@ setup_ssl() {
     # Check if domain resolves to this server
     local server_ip
     server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
-    local domain_ip
-    domain_ip=$(nslookup "$domain" | grep -A1 "Name:" | tail -n1 | awk '{print $2}' 2>/dev/null)
+    local domain_ip=""
+    
+    # Try different DNS lookup tools
+    if command -v dig >/dev/null 2>&1; then
+        domain_ip=$(dig +short "$domain" | head -n1 2>/dev/null)
+    elif command -v host >/dev/null 2>&1; then
+        domain_ip=$(host "$domain" | grep "has address" | head -n1 | awk '{print $4}' 2>/dev/null)
+    elif command -v nslookup >/dev/null 2>&1; then
+        domain_ip=$(nslookup "$domain" | grep -A1 "Name:" | tail -n1 | awk '{print $2}' 2>/dev/null)
+    fi
     
     if [[ "$server_ip" != "$domain_ip" ]]; then
         log "WARN" "Domain $domain (IP: $domain_ip) does not point to this server (IP: $server_ip)"
