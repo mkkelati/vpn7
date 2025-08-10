@@ -23,15 +23,38 @@ Simply run `menu` from anywhere to access the interactive management interface:
 
 - **Ubuntu 20.04 LTS** (required)
 - **Root access** (sudo privileges)
-- **Domain name** pointing to your server's IP
+- **Domain name** pointing to your server's IP (optional with self-signed certificates)
 - **Open ports** 80 and 443
 
 ## 🛠 Installation Process
 
 1. **Run the installer**: `sudo menu install`
-2. **Enter your domain**: e.g., `vpn.example.com`
-3. **Automatic setup**: SSL certificates, firewall, and Xray configuration
-4. **Ready to use**: Add users and start connecting
+2. **Enter your domain**: e.g., `vpn.example.com` (or any name with self-signed)
+3. **Choose SSL option**: Let's Encrypt (requires valid domain) or Self-signed (works immediately)
+4. **Automatic setup**: SSL certificates, firewall, and Xray configuration
+5. **Ready to use**: Add users and start connecting
+
+## 🔐 SSL Certificate Options
+
+### Let's Encrypt (Recommended for production)
+- **Free and trusted** by all devices
+- **Requires valid domain** pointing to your server
+- **Automatic renewal** every 90 days
+- **Best for public servers**
+
+### Self-Signed Certificates
+- **Works immediately** without domain setup
+- **Perfect for testing** or private networks
+- **Requires "Allow Insecure"** setting in VPN clients
+- **No external dependencies**
+
+```bash
+# Install with self-signed certificates
+sudo menu install --self-signed
+
+# Or choose during installation
+sudo menu install
+```
 
 ## 👥 User Management
 
@@ -68,9 +91,18 @@ After adding a user, you'll receive:
 3. **Connection details** for manual setup
 
 ### Example VLESS Connection
+
+**With Let's Encrypt:**
 ```
 vless://uuid@domain.com:443?type=ws&security=tls&path=/randompath&host=domain.com&sni=domain.com#MyVPN_VLESS
 ```
+
+**With Self-Signed Certificates:**
+```
+vless://uuid@SERVER_IP:443?type=ws&security=tls&path=/randompath&host=domain.com&sni=domain.com&allowInsecure=1#MyVPN_VLESS_SelfSigned
+```
+
+**Important:** For self-signed certificates, enable "Allow Insecure" or "Skip Certificate Verification" in your VPN client.
 
 ## 🔧 Management Commands
 

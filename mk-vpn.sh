@@ -53,6 +53,7 @@ DOMAIN=""
 WS_PATH=""
 XRAY_PORT=""
 DRY_RUN=false
+USE_SELF_SIGNED=false
 
 ################################################################################
 # Utility Functions
@@ -199,7 +200,7 @@ update_packages() {
 
 # Install required packages
 install_packages() {
-    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime" "net-tools" "dnsutils")
+    local packages=("curl" "wget" "jq" "nginx" "certbot" "python3-certbot-nginx" "unzip" "socat" "ufw" "cron" "uuid-runtime" "net-tools" "dnsutils" "openssl")
     local missing_packages=()
     
     log "INFO" "Checking required packages..."
@@ -440,7 +441,7 @@ configure_nginx() {
     # Remove default site
     rm -f /etc/nginx/sites-enabled/default
     
-    # Create initial HTTP-only configuration (SSL will be added by certbot)
+    # Create initial HTTP-only configuration (SSL will be added later)
     cat > "$site_config" << EOF
 server {
     listen 80;
@@ -502,12 +503,150 @@ EOF
     log "SUCCESS" "NGINX configured for $domain"
 }
 
+# Generate self-signed certificate
+generate_self_signed_cert() {
+    local domain=$1
+    local cert_dir="/etc/ssl/xray"
+    local server_ip
+    server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
+    
+    if [[ $DRY_RUN == true ]]; then
+        log "INFO" "DRY RUN: Would generate self-signed certificate"
+        return
+    fi
+    
+    log "INFO" "Generating self-signed certificate..."
+    
+    # Create certificate directory
+    mkdir -p "$cert_dir"
+    
+    # Generate self-signed certificate
+    openssl req -x509 -newkey rsa:2048 \
+        -keyout "$cert_dir/private.key" \
+        -out "$cert_dir/cert.crt" \
+        -days 365 -nodes \
+        -subj "/C=US/ST=State/L=City/O=XrayVPN/CN=${server_ip}" \
+        -addext "subjectAltName=IP:${server_ip},DNS:${domain},DNS:localhost" \
+        2>/dev/null
+    
+    # Set proper permissions
+    chmod 600 "$cert_dir/private.key"
+    chmod 644 "$cert_dir/cert.crt"
+    chown root:root "$cert_dir"/*
+    
+    log "SUCCESS" "Self-signed certificate generated for IP: $server_ip"
+    
+    # Update NGINX configuration for self-signed SSL
+    update_nginx_ssl_config "$domain" "$cert_dir"
+}
+
+# Update NGINX configuration for self-signed SSL
+update_nginx_ssl_config() {
+    local domain=$1
+    local cert_dir=$2
+    local site_config="${NGINX_SITES_DIR}/${domain}"
+    local ws_path=$WS_PATH
+    local xray_port=$XRAY_PORT
+    
+    if [[ $DRY_RUN == true ]]; then
+        log "INFO" "DRY RUN: Would update NGINX SSL configuration"
+        return
+    fi
+    
+    log "INFO" "Updating NGINX configuration for SSL..."
+    
+    # Create HTTPS configuration
+    cat > "$site_config" << EOF
+server {
+    listen 80;
+    server_name ${domain};
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+    
+    # Self-signed SSL configuration
+    ssl_certificate ${cert_dir}/cert.crt;
+    ssl_certificate_key ${cert_dir}/private.key;
+    
+    # Modern SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    
+    # Hide server info
+    server_tokens off;
+    
+    # WebSocket proxy for Xray
+    location ${ws_path} {
+        if (\$http_upgrade != "websocket") {
+            return 404;
+        }
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:${xray_port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    
+    # VMess WebSocket proxy
+    location ${ws_path}/vmess {
+        if (\$http_upgrade != "websocket") {
+            return 404;
+        }
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:$((xray_port + 1));
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+    
+    # Camouflage - serve a basic page for other requests
+    location / {
+        return 200 "<!DOCTYPE html><html><head><title>Welcome</title></head><body><h1>Welcome to ${domain}</h1><p>This is a regular website.</p></body></html>";
+        add_header Content-Type text/html;
+    }
+}
+EOF
+    
+    # Test and reload NGINX
+    if nginx -t; then
+        systemctl reload nginx
+        log "SUCCESS" "NGINX SSL configuration updated and reloaded"
+    else
+        log "ERROR" "NGINX configuration test failed"
+        return 1
+    fi
+}
+
 # Setup SSL with Let's Encrypt
 setup_ssl() {
     local domain=$1
     
     if [[ $DRY_RUN == true ]]; then
         log "INFO" "DRY RUN: Would setup SSL for $domain"
+        return
+    fi
+    
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        generate_self_signed_cert "$domain"
         return
     fi
     
@@ -533,11 +672,19 @@ setup_ssl() {
         domain_ip=$(nslookup "$domain" | grep -A1 "Name:" | tail -n1 | awk '{print $2}' 2>/dev/null)
     fi
     
-    if [[ "$server_ip" != "$domain_ip" ]]; then
+    if [[ -z "$domain_ip" || "$server_ip" != "$domain_ip" ]]; then
         log "WARN" "Domain $domain (IP: $domain_ip) does not point to this server (IP: $server_ip)"
-        log "WARN" "SSL certificate generation may fail. Please update your DNS records."
+        log "INFO" "Would you like to use a self-signed certificate instead?"
         
-        read -p "Continue anyway? (y/N): " continue_ssl
+        read -p "Use self-signed certificate? (Y/n): " use_self_signed
+        if [[ ! $use_self_signed =~ ^[Nn] ]]; then
+            USE_SELF_SIGNED=true
+            generate_self_signed_cert "$domain"
+            return
+        fi
+        
+        log "WARN" "SSL certificate generation may fail. Please update your DNS records."
+        read -p "Continue with Let's Encrypt anyway? (y/N): " continue_ssl
         if [[ ! $continue_ssl =~ ^[Yy] ]]; then
             log "INFO" "SSL setup skipped. You can run 'certbot --nginx -d $domain' manually later."
             return
@@ -553,8 +700,9 @@ setup_ssl() {
         log "SUCCESS" "SSL auto-renewal configured"
     else
         log "ERROR" "Failed to obtain SSL certificate"
-        log "INFO" "You can try manually later with: certbot --nginx -d $domain"
-        log "INFO" "Make sure your domain points to this server's IP: $server_ip"
+        log "INFO" "Falling back to self-signed certificate..."
+        USE_SELF_SIGNED=true
+        generate_self_signed_cert "$domain"
     fi
 }
 
@@ -731,15 +879,26 @@ generate_client_config() {
     local domain=$DOMAIN
     local ws_path=$WS_PATH
     local port=443
+    local server_ip
+    server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
+    
+    # Use server IP if self-signed certificate is used
+    local connect_host="$domain"
+    local insecure_param=""
+    
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        connect_host="$server_ip"
+        insecure_param="&allowInsecure=1"
+    fi
     
     case $protocol in
         "vless")
-            echo "vless://${uuid}@${domain}:${port}?type=ws&security=tls&path=${ws_path}&host=${domain}&sni=${domain}#${domain}_VLESS"
+            echo "vless://${uuid}@${connect_host}:${port}?type=ws&security=tls&path=${ws_path}&host=${domain}&sni=${domain}${insecure_param}#${domain}_VLESS"
             ;;
         "vmess")
             local vmess_config
             vmess_config=$(jq -n \
-                --arg add "$domain" \
+                --arg add "$connect_host" \
                 --arg aid "0" \
                 --arg host "$domain" \
                 --arg id "$uuid" \
@@ -752,6 +911,7 @@ generate_client_config() {
                 --arg tls "tls" \
                 --arg type "none" \
                 --arg v "2" \
+                --argjson skip_cert_verify "$(if [[ $USE_SELF_SIGNED == true ]]; then echo true; else echo false; fi)" \
                 '{
                     add: $add,
                     aid: $aid,
@@ -765,7 +925,8 @@ generate_client_config() {
                     sni: $sni,
                     tls: $tls,
                     type: $type,
-                    v: $v
+                    v: $v,
+                    "skip-cert-verify": $skip_cert_verify
                 }')
             echo "vmess://$(echo "$vmess_config" | base64 -w 0)"
             ;;
@@ -778,6 +939,17 @@ generate_client_json() {
     local protocol=$2
     local domain=$DOMAIN
     local ws_path=$WS_PATH
+    local server_ip
+    server_ip=$(curl -s ifconfig.me || curl -s ipinfo.io/ip)
+    
+    # Use server IP if self-signed certificate is used
+    local connect_host="$domain"
+    local tls_settings=""
+    
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        connect_host="$server_ip"
+        tls_settings='"allowInsecure": true,'
+    fi
     
     case $protocol in
         "vless")
@@ -789,7 +961,7 @@ generate_client_json() {
       "settings": {
         "vnext": [
           {
-            "address": "${domain}",
+            "address": "${connect_host}",
             "port": 443,
             "users": [
               {
@@ -805,6 +977,7 @@ generate_client_json() {
         "network": "ws",
         "security": "tls",
         "tlsSettings": {
+          ${tls_settings}
           "serverName": "${domain}"
         },
         "wsSettings": {
@@ -833,7 +1006,7 @@ EOF
       "settings": {
         "vnext": [
           {
-            "address": "${domain}",
+            "address": "${connect_host}",
             "port": 443,
             "users": [
               {
@@ -849,6 +1022,7 @@ EOF
         "network": "ws",
         "security": "tls",
         "tlsSettings": {
+          ${tls_settings}
           "serverName": "${domain}"
         },
         "wsSettings": {
@@ -894,6 +1068,27 @@ cmd_install() {
     fi
     validate_domain "$DOMAIN"
     
+    # Ask about SSL certificate type
+    if [[ $USE_SELF_SIGNED == false ]]; then
+        echo
+        print_color "$CYAN" "SSL Certificate Options:"
+        print_color "$WHITE" "1. Let's Encrypt (free, requires valid domain)"
+        print_color "$WHITE" "2. Self-signed (works immediately, any domain/IP)"
+        echo
+        read -p "Choose SSL option [1-2]: " ssl_choice
+        
+        case $ssl_choice in
+            2)
+                USE_SELF_SIGNED=true
+                log "INFO" "Using self-signed certificates"
+                ;;
+            *)
+                USE_SELF_SIGNED=false
+                log "INFO" "Using Let's Encrypt certificates"
+                ;;
+        esac
+    fi
+    
     if [[ -z $WS_PATH ]]; then
         WS_PATH="/$(openssl rand -hex 8)"
         log "INFO" "Generated WebSocket path: $WS_PATH"
@@ -932,6 +1127,7 @@ cmd_install() {
 DOMAIN=${DOMAIN}
 WS_PATH=${WS_PATH}
 XRAY_PORT=${XRAY_PORT}
+USE_SELF_SIGNED=${USE_SELF_SIGNED}
 EOF
     
     log "SUCCESS" "MK VPN installation completed successfully!"
@@ -940,12 +1136,20 @@ EOF
     print_color "$CYAN" "Domain: $DOMAIN"
     print_color "$CYAN" "WebSocket Path: $WS_PATH"
     print_color "$CYAN" "Xray Port: $XRAY_PORT"
+    print_color "$CYAN" "SSL Type: $(if [[ $USE_SELF_SIGNED == true ]]; then echo "Self-signed"; else echo "Let's Encrypt"; fi)"
     print_color "$CYAN" "Admin UUID: $initial_uuid"
     echo
     print_color "$YELLOW" "Next steps:"
-    print_color "$WHITE" "1. Ensure your domain points to this server's IP"
-    print_color "$WHITE" "2. Use 'mk-vpn add-user' to create client accounts"
-    print_color "$WHITE" "3. Use 'mk-vpn status' to check system status"
+    if [[ $USE_SELF_SIGNED == true ]]; then
+        print_color "$WHITE" "1. VPN is ready to use immediately with self-signed certificates"
+        print_color "$WHITE" "2. Clients must enable 'Allow Insecure' or 'Skip Certificate Verification'"
+        print_color "$WHITE" "3. Use 'mk-vpn add-user' to create client accounts"
+        print_color "$WHITE" "4. Use 'mk-vpn status' to check system status"
+    else
+        print_color "$WHITE" "1. Ensure your domain points to this server's IP"
+        print_color "$WHITE" "2. Use 'mk-vpn add-user' to create client accounts"
+        print_color "$WHITE" "3. Use 'mk-vpn status' to check system status"
+    fi
 }
 
 # Add user
@@ -1468,11 +1672,18 @@ ADD-USER OPTIONS:
 
 GLOBAL OPTIONS:
     --dry-run                        - Show what would be done without executing
+    --self-signed                    - Use self-signed certificates instead of Let's Encrypt
+    --domain <domain>                - Set domain name
+    --ws-path <path>                 - Set WebSocket path
+    --xray-port <port>               - Set Xray port
     --help                           - Show this help message
 
 EXAMPLES:
-    # Install MK VPN
+    # Install MK VPN with Let's Encrypt
     $0 install
+
+    # Install MK VPN with self-signed certificates
+    $0 install --self-signed
 
     # Add a user with 30-day expiry and 100GB limit
     $0 add-user --name john --expiry 30 --limit 100
@@ -1529,6 +1740,10 @@ main() {
             --xray-port)
                 XRAY_PORT="$2"
                 shift 2
+                ;;
+            --self-signed)
+                USE_SELF_SIGNED=true
+                shift
                 ;;
             install|add-user|list-users|revoke-user|renew-user|backup|restore|status|uninstall|self-update)
                 break
