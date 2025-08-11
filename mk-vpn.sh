@@ -484,7 +484,32 @@ create_xray_service() {
         return
     fi
     
-    cat > "$service_file" << 'EOF'
+    # Create service file with conditional setcap for Direct TLS mode
+    if [[ $USE_DIRECT_PORT == true ]]; then
+        cat > "$service_file" << 'EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=xray
+Group=xray
+Type=simple
+ExecStartPre=/usr/sbin/setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+ExecStartPre=/usr/local/bin/xray -test -config /etc/xray/config.json
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        log "INFO" "Created Xray systemd service with setcap support for Direct TLS mode"
+    else
+        cat > "$service_file" << 'EOF'
 [Unit]
 Description=Xray Service
 Documentation=https://github.com/xtls
@@ -504,6 +529,8 @@ LimitNOFILE=1000000
 [Install]
 WantedBy=multi-user.target
 EOF
+        log "INFO" "Created Xray systemd service for NGINX proxy mode"
+    fi
     
     systemctl daemon-reload
     systemctl enable xray
@@ -1467,6 +1494,10 @@ cmd_install() {
     create_xray_service
     if [[ $USE_DIRECT_PORT == true ]]; then
         generate_xray_config_direct "$initial_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+        # Apply setcap immediately for Direct TLS mode
+        log "INFO" "Applying network bind capability for Direct TLS mode..."
+        setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+        log "SUCCESS" "Network bind capability applied to Xray binary"
     else
         generate_xray_config "$initial_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
         configure_nginx "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
@@ -2000,6 +2031,10 @@ cmd_force_complete_installation() {
     # Generate configuration
     if [[ "$use_direct_port" == "true" ]]; then
         generate_xray_config_direct "$admin_uuid" "$domain" "$ws_path" "$xray_port"
+        # Apply setcap immediately for Direct TLS mode
+        log "INFO" "Applying network bind capability for Direct TLS mode..."
+        setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+        log "SUCCESS" "Network bind capability applied to Xray binary"
     else
         generate_xray_config "$admin_uuid" "$domain" "$ws_path" "$xray_port"
         configure_nginx "$domain" "$ws_path" "$xray_port"
@@ -2248,6 +2283,10 @@ cmd_fix_xray_service() {
             
             if [[ $USE_DIRECT_PORT == true ]]; then
                 generate_xray_config_direct "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+                # Apply setcap immediately for Direct TLS mode
+                log "INFO" "Applying network bind capability for Direct TLS mode..."
+                setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+                log "SUCCESS" "Network bind capability applied to Xray binary"
             else
                 generate_xray_config "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
             fi
@@ -2297,13 +2336,28 @@ cmd_fix_xray_service() {
         print_color "$GREEN" "✓ GeoIP files downloaded"
     fi
     
-    # Step 5: Check file permissions
-    print_color "$CYAN" "Step 5: Checking file permissions..."
+    # Step 5: Check file permissions and network capabilities
+    print_color "$CYAN" "Step 5: Checking file permissions and network capabilities..."
     local permission_issues=false
     
     if [[ ! -r "$XRAY_CONFIG_FILE" ]]; then
         print_color "$RED" "✗ Configuration file not readable"
         permission_issues=true
+    fi
+    
+    # Check if Direct TLS mode is being used and setcap is needed
+    if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+        source "${XRAY_DATA_DIR}/config.env"
+        if [[ $USE_DIRECT_PORT == true ]]; then
+            local current_caps
+            current_caps=$(getcap /usr/local/bin/xray 2>/dev/null || echo "")
+            if [[ ! $current_caps =~ cap_net_bind_service ]]; then
+                print_color "$RED" "✗ Network bind capability missing for Direct TLS mode"
+                permission_issues=true
+            else
+                print_color "$GREEN" "✓ Network bind capability OK"
+            fi
+        fi
     fi
     
     if [[ $permission_issues == true ]] || [[ ! -d "$XRAY_LOG_DIR" ]] || [[ ! -d "$XRAY_DATA_DIR" ]]; then
@@ -2316,6 +2370,16 @@ cmd_fix_xray_service() {
         chown -R xray:xray "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" "$XRAY_DATA_DIR" 2>/dev/null || true
         chmod 755 "$XRAY_CONFIG_DIR" "$XRAY_LOG_DIR" "$XRAY_DATA_DIR"
         [[ -f "$XRAY_CONFIG_FILE" ]] && chmod 640 "$XRAY_CONFIG_FILE"
+        
+        # Apply setcap if Direct TLS mode
+        if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+            source "${XRAY_DATA_DIR}/config.env"
+            if [[ $USE_DIRECT_PORT == true ]]; then
+                print_color "$YELLOW" "Applying network bind capability for Direct TLS mode..."
+                setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+                print_color "$GREEN" "✓ Network bind capability applied"
+            fi
+        fi
         
         print_color "$GREEN" "✓ Permissions fixed"
     else

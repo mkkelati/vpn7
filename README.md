@@ -48,6 +48,20 @@ Simply run `menu` from anywhere to access the interactive management interface:
 - **Requires "Allow Insecure"** setting in VPN clients
 - **No external dependencies**
 
+## 🌐 Connection Modes
+
+### Direct TLS Mode (Recommended)
+- **Xray handles TLS directly** on port 443
+- **Better performance** - no NGINX overhead
+- **Automatic setcap configuration** for privileged port binding
+- **Survives server reboots** via systemd service
+- **Self-signed certificates supported**
+
+### NGINX Proxy Mode
+- **NGINX handles TLS** and proxies to Xray
+- **Traditional reverse proxy setup**
+- **Useful for complex routing scenarios**
+
 ```bash
 # Install with self-signed certificates
 sudo menu install --self-signed
@@ -111,9 +125,27 @@ vless://uuid@SERVER_IP:443?type=ws&security=tls&path=/randompath&host=domain.com
 | `menu install` | Full VPN server installation |
 | `menu add-user` | Create new user account |
 | `menu list-users` | Display all users |
+| `menu force-complete` | Complete interrupted installation |
+| `menu quick-add` | Auto-fix and add user |
+| `menu fix-xray` | Troubleshoot and repair Xray service |
 | `menu status` | System and service status |
 | `menu backup` | Create configuration backup |
 | `menu self-update` | Update to latest version |
+
+## 🚀 New Recovery Features
+
+### Automatic Installation Recovery
+- **Detects incomplete installations** and offers completion
+- **Force Complete Installation** (menu option 4) to retry failed setups
+- **Quick Add User** (menu option 5) auto-detects existing config
+
+### Comprehensive Troubleshooter
+- **Fix Xray Service** (menu option 6) automatically diagnoses and repairs:
+  - Missing GeoIP database files
+  - Permission issues
+  - Network capability problems (setcap)
+  - Port conflicts
+  - Service configuration errors
 
 ## 🔐 Security Features
 
