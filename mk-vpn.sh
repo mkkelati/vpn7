@@ -2265,13 +2265,88 @@ cmd_fix_xray_service() {
         print_color "$GREEN" "✓ Configuration file exists"
         
         # Test configuration
-        if /usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" >/dev/null 2>&1; then
+        local test_output
+        test_output=$(/usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" 2>&1)
+        if [[ $? -eq 0 ]]; then
             print_color "$GREEN" "✓ Configuration is valid"
         else
             print_color "$RED" "✗ Configuration has errors"
             print_color "$YELLOW" "Configuration test output:"
-            /usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" 2>&1 | head -10
+            echo "$test_output" | head -10
             echo
+            
+            # Interactive troubleshooting for configuration errors
+            print_color "$CYAN" "🔍 Let's fix this configuration issue:"
+            
+            # Check for common issues and provide guided fixes
+            if echo "$test_output" | grep -q "no such file or directory"; then
+                if echo "$test_output" | grep -q "cert.crt\|private.key"; then
+                    print_color "$YELLOW" "🔒 Issue: Missing SSL certificate files"
+                    print_color "$WHITE" "This usually happens in Direct TLS mode when certificates are missing."
+                    echo
+                    read -p "Generate self-signed certificates now? (Y/n): " generate_certs
+                    if [[ ! $generate_certs =~ ^[Nn] ]]; then
+                        print_color "$CYAN" "Generating self-signed certificates..."
+                        mkdir -p /etc/ssl/xray
+                        local server_ip
+                        server_ip=$(curl -s ifconfig.me || echo "127.0.0.1")
+                        openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
+                            -subj "/C=US/ST=CA/L=City/O=Organization/CN=$server_ip" \
+                            -keyout /etc/ssl/xray/private.key \
+                            -out /etc/ssl/xray/cert.crt
+                        chown -R xray:xray /etc/ssl/xray
+                        chmod 600 /etc/ssl/xray/private.key
+                        chmod 644 /etc/ssl/xray/cert.crt
+                        print_color "$GREEN" "✓ Self-signed certificates generated"
+                    fi
+                elif echo "$test_output" | grep -q "geoip.dat\|geosite.dat"; then
+                    print_color "$YELLOW" "🌍 Issue: Missing GeoIP database files"
+                    print_color "$WHITE" "These files are required for Xray routing rules."
+                    echo
+                    read -p "Download GeoIP files now? (Y/n): " download_geo
+                    if [[ ! $download_geo =~ ^[Nn] ]]; then
+                        print_color "$CYAN" "Downloading GeoIP database files..."
+                        cd /usr/local/bin || exit 1
+                        wget -q https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+                        wget -q https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+                        chown xray:xray geoip.dat geosite.dat 2>/dev/null || true
+                        chmod 644 geoip.dat geosite.dat
+                        print_color "$GREEN" "✓ GeoIP files downloaded"
+                    fi
+                fi
+            elif echo "$test_output" | grep -q "bind: permission denied"; then
+                print_color "$YELLOW" "🔐 Issue: Permission denied for port 443"
+                print_color "$WHITE" "Xray needs special permission to bind to privileged ports."
+                echo
+                read -p "Apply network bind capability now? (Y/n): " apply_setcap
+                if [[ ! $apply_setcap =~ ^[Nn] ]]; then
+                    print_color "$CYAN" "Applying network bind capability..."
+                    setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+                    print_color "$GREEN" "✓ Network bind capability applied"
+                fi
+            fi
+            
+            # Offer to regenerate configuration
+            echo
+            read -p "Regenerate Xray configuration from scratch? (y/N): " regen_config
+            if [[ $regen_config =~ ^[Yy] ]]; then
+                if [[ -f "${XRAY_DATA_DIR}/config.env" ]]; then
+                    source "${XRAY_DATA_DIR}/config.env"
+                    local admin_uuid
+                    admin_uuid=$(generate_uuid)
+                    
+                    if [[ $USE_DIRECT_PORT == true ]]; then
+                        generate_xray_config_direct "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+                        setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+                    else
+                        generate_xray_config "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+                    fi
+                    print_color "$GREEN" "✓ Configuration regenerated"
+                else
+                    print_color "$RED" "✗ Cannot regenerate: config.env missing"
+                    print_color "$YELLOW" "Please run: menu force-complete"
+                fi
+            fi
         fi
     else
         print_color "$RED" "✗ Configuration file missing"
@@ -2289,6 +2364,14 @@ cmd_fix_xray_service() {
                 log "SUCCESS" "Network bind capability applied to Xray binary"
             else
                 generate_xray_config "$admin_uuid" "$DOMAIN" "$WS_PATH" "$XRAY_PORT"
+            fi
+        else
+            print_color "$YELLOW" "No config.env found. Manual configuration needed."
+            echo
+            read -p "Start fresh installation setup? (y/N): " fresh_setup
+            if [[ $fresh_setup =~ ^[Yy] ]]; then
+                print_color "$CYAN" "Please run: menu force-complete"
+                return
             fi
         fi
     fi
@@ -2425,6 +2508,24 @@ cmd_fix_xray_service() {
     # Step 8: Attempt to start service
     print_color "$CYAN" "Step 8: Starting Xray service..."
     
+    # Final configuration test before starting
+    print_color "$YELLOW" "Performing final configuration test..."
+    local final_test_output
+    final_test_output=$(/usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        print_color "$RED" "❌ Configuration test still failing!"
+        print_color "$YELLOW" "Error:"
+        echo "$final_test_output"
+        echo
+        read -p "Continue anyway and try to start service? (y/N): " force_start
+        if [[ ! $force_start =~ ^[Yy] ]]; then
+            print_color "$CYAN" "Please fix the configuration issues first."
+            return
+        fi
+    else
+        print_color "$GREEN" "✓ Configuration test passed"
+    fi
+    
     # Reload systemd daemon
     systemctl daemon-reload
     
@@ -2438,15 +2539,83 @@ cmd_fix_xray_service() {
         else
             print_color "$RED" "❌ Service start command succeeded but service is not running"
             print_color "$YELLOW" "Checking logs:"
-            journalctl -u xray --no-pager -n 10
+            local start_logs
+            start_logs=$(journalctl -u xray --no-pager -n 10)
+            echo "$start_logs"
+            
+            # Interactive troubleshooting for startup failures
+            echo
+            print_color "$CYAN" "🔍 Let's troubleshoot this startup issue:"
+            
+            if echo "$start_logs" | grep -q "permission denied"; then
+                print_color "$YELLOW" "Issue: Permission problems detected"
+                read -p "Reapply setcap and restart? (Y/n): " fix_perms
+                if [[ ! $fix_perms =~ ^[Nn] ]]; then
+                    setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+                    systemctl restart xray
+                    sleep 2
+                    if systemctl is-active --quiet xray; then
+                        print_color "$GREEN" "✓ Service started after permission fix!"
+                    fi
+                fi
+            elif echo "$start_logs" | grep -q "address already in use"; then
+                print_color "$YELLOW" "Issue: Port conflict detected"
+                read -p "Kill conflicting processes and restart? (Y/n): " kill_conflicts
+                if [[ ! $kill_conflicts =~ ^[Nn] ]]; then
+                    pkill -f xray 2>/dev/null || true
+                    systemctl stop nginx 2>/dev/null || true
+                    sleep 2
+                    systemctl start xray
+                    sleep 2
+                    if systemctl is-active --quiet xray; then
+                        print_color "$GREEN" "✓ Service started after clearing conflicts!"
+                    fi
+                fi
+            fi
         fi
     else
         print_color "$RED" "❌ Failed to start Xray service"
         print_color "$YELLOW" "Error details:"
-        systemctl status xray --no-pager -l | head -15
+        local status_output
+        status_output=$(systemctl status xray --no-pager -l 2>&1 | head -15)
+        echo "$status_output"
         echo
         print_color "$YELLOW" "Recent logs:"
-        journalctl -u xray --no-pager -n 15
+        local error_logs
+        error_logs=$(journalctl -u xray --no-pager -n 15)
+        echo "$error_logs"
+        
+        # Interactive troubleshooting for start failures
+        echo
+        print_color "$CYAN" "🔧 Interactive Fix Options:"
+        echo "1. Regenerate systemd service file"
+        echo "2. Manual configuration test"
+        echo "3. Reset and start fresh"
+        echo "4. Skip and continue"
+        echo
+        read -p "Choose an option (1-4): " fix_option
+        
+        case $fix_option in
+            1)
+                print_color "$CYAN" "Regenerating systemd service..."
+                create_xray_service
+                systemctl daemon-reload
+                systemctl start xray
+                sleep 2
+                ;;
+            2)
+                print_color "$CYAN" "Running manual configuration test..."
+                /usr/local/bin/xray -test -config "$XRAY_CONFIG_FILE"
+                echo
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                print_color "$CYAN" "To start fresh, please run: menu force-complete"
+                ;;
+            *)
+                print_color "$YELLOW" "Continuing with troubleshooter..."
+                ;;
+        esac
     fi
     
     # Step 9: Final status check
@@ -2482,11 +2651,63 @@ cmd_fix_xray_service() {
         print_color "$WHITE" "  1. Use option 2 to add users"
         print_color "$WHITE" "  2. Use option 5 for quick user creation"
         print_color "$WHITE" "  3. Use option 11 to check status"
+        echo
+        read -p "Would you like to create your first user now? (Y/n): " create_user
+        if [[ ! $create_user =~ ^[Nn] ]]; then
+            print_color "$CYAN" "Great! Let's create your first user..."
+            echo "Please run: menu add-user"
+            echo "Or for quick setup: menu quick-add"
+        fi
     else
-        print_color "$RED" "⚠️  Xray is still not working. Please:"
-        print_color "$WHITE" "  1. Check the error logs above"
-        print_color "$WHITE" "  2. Try option 4 'Force Complete Installation'"
-        print_color "$WHITE" "  3. Or contact support with the error details"
+        print_color "$RED" "⚠️  Xray is still not working."
+        echo
+        print_color "$CYAN" "🚨 URGENT TROUBLESHOOTING OPTIONS:"
+        echo "1. Check configuration manually"
+        echo "2. Regenerate all config files"  
+        echo "3. Start completely fresh"
+        echo "4. Get step-by-step help"
+        echo "5. Exit troubleshooter"
+        echo
+        read -p "Choose an option (1-5): " urgent_option
+        
+        case $urgent_option in
+            1)
+                print_color "$CYAN" "Manual configuration check:"
+                echo "Run this command to see the exact error:"
+                print_color "$YELLOW" "/usr/local/bin/xray -test -config /etc/xray/config.json"
+                echo
+                echo "Then check systemd service:"
+                print_color "$YELLOW" "systemctl status xray"
+                ;;
+            2)
+                print_color "$CYAN" "To regenerate all configuration:"
+                echo "Please run: menu force-complete"
+                ;;
+            3)
+                print_color "$CYAN" "To start completely fresh:"
+                echo "1. Run: menu uninstall"
+                echo "2. Then: menu install"
+                ;;
+            4)
+                print_color "$CYAN" "Step-by-step help:"
+                echo "1. First, check what's wrong:"
+                print_color "$YELLOW" "   /usr/local/bin/xray -test -config /etc/xray/config.json"
+                echo
+                echo "2. Common fixes:"
+                echo "   - Missing certificates: Run this troubleshooter again (option 6)"
+                echo "   - Permission issues: sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray"
+                echo "   - Port conflicts: sudo pkill -f xray && sudo systemctl start xray"
+                echo
+                echo "3. If still failing:"
+                echo "   - Run: menu force-complete"
+                ;;
+            *)
+                print_color "$YELLOW" "Exiting troubleshooter. You can:"
+                print_color "$WHITE" "  - Try 'menu force-complete' to rebuild everything"
+                print_color "$WHITE" "  - Run 'menu fix-xray' again for another attempt"
+                print_color "$WHITE" "  - Check logs with: journalctl -u xray -n 20"
+                ;;
+        esac
     fi
 }
 
